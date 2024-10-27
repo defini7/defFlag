@@ -40,20 +40,26 @@
 #include <variant>
 #include <optional>
 #include <unordered_map>
+#include <stdexcept>
+#include <iostream>
 
 #pragma endregion // Includes
+
+#define DEF_FLAG_CHECK_TRUE_BOOLEAN(v) (v == "" || v == "true" || v == "True" || v == "TRUE" || v == "t" || v == "T" || v == "1")
+#define DEF_FLAG_CHECK_FALSE_BOOLEAN(v) (v == "false" || v == "False" || v == "FALSE" || v == "f" || v == "F" || v == "0")
 
 namespace def
 {
     class Flag
     {
     public:
-        template <class T>
         struct Entry
         {
+            using Type = std::variant<bool, float, double, int32_t, int64_t, uint32_t, uint64_t, std::string>;
+
             std::string usage;
-            T value;
-            T defaultValue;
+            Type value;
+            Type defaultValue;
         };
 
         struct Exception : std::exception
@@ -65,7 +71,7 @@ namespace def
     public:
         Flag() = default;
 
-        void Parse(const size_t arguments_count, char* arguments[], bool start_from_next = true);
+        size_t Parse(const size_t argumentsCount, char* arguments[], const bool ignoreUnexpectedFlags = true, const bool startFromNext = true);
 
         bool& Set(const std::string& name, const bool defaultValue, const std::string& usage);
         std::string& Set(const std::string& name, const char* defaultValue, const std::string& usage);
@@ -79,8 +85,8 @@ namespace def
         uint32_t& Set(const std::string& name, const uint32_t defaultValue, const std::string& usage);
         uint64_t& Set(const std::string& name, const uint64_t defaultValue, const std::string& usage);
 
-        template <class T>
-        std::optional<std::reference_wrapper<const Entry<T>>> Lookup(const std::string& name);
+        std::optional<std::reference_wrapper<const Entry>> Lookup(const std::string& name);
+        void PrintUsage(std::ostream& os = std::cout);
 
     private:
         enum class ParserState
@@ -92,12 +98,10 @@ namespace def
 
         template <class... Ts> struct Overload : Ts... { using Ts::operator()...; };
 
+        void MakeTrueOnBool(const std::string& name);
+
     private:
-        std::unordered_map<std::string, std::variant<
-            Entry<bool>, Entry<float>, Entry<double>,
-            Entry<int32_t>, Entry<int64_t>,
-            Entry<uint32_t>, Entry<uint64_t>, Entry<std::string>
-        >> m_Entries;
+        std::unordered_map<std::string, Entry> m_Entries;
 
     };
 }
@@ -105,7 +109,9 @@ namespace def
 #ifdef DEF_FLAG_IMPL
 #undef DEF_FLAG_IMPL
 
-void def::Flag::Parse(const size_t argumentsCount, char* arguments[], bool startFromNext)
+#define CHECK_VALUE(target, source, name) try { target = source; } catch (const std::exception& e) { (void)e; throw Exception("[defFlag] Value of an unexpected type for the " + name + " flag"); }
+
+size_t def::Flag::Parse(const size_t argumentsCount, char* arguments[], const bool ignoreUnexpectedFlags, const bool startFromNext)
 {
     if (!arguments || argumentsCount == 1 && startFromNext)
         throw Exception("[defFlag] No arguments were provided");
@@ -116,41 +122,60 @@ void def::Flag::Parse(const size_t argumentsCount, char* arguments[], bool start
     std::string name;
     std::string value;
 
-    for (size_t i = startFromNext ? 1 : 0; i < argumentsCount; i++)
+    size_t i = startFromNext ? 1 : 0;
+
+    if (strcmp(arguments[i], "-h") == 0 || strcmp(arguments[i], "--help") == 0 || strcmp(arguments[i], "-help") == 0)
+    {
+        PrintUsage();
+        i++;
+    }
+
+    for (; i < argumentsCount; i++)
     {
         char* arg = arguments[i];
+
+        if (!arg)
+        {
+            // The user tried to decieve us... MHA-HA-HA
+            throw Exception("[defFlag] Tried to read an argument outside of the array, you probably need to change argumentsCount argument");
+        }
+
         size_t len = strlen(arg);
 
-        for (size_t i = 0; i < len; i++)
+        for (size_t j = 0; j < len; j++)
         {
             switch (stateNow)
             {
             case ParserState::NewToken:
             {
-                if (arg[i] == '-')
+                if (arg[j] == '-')
                 {
                     // That is definetly must be a flag name
                     stateNext = ParserState::Name;
                 }
                 else
-                    throw Exception("[defFlag] You can't start a flag without '-' symbol");
+                {
+                    // Now we have something like this: -flag a b c d
+                    // so return an index of the first argument in a tail
+                    return i;
+                }
             }
             break;
 
             case ParserState::Name:
             {
-                if (arg[i] == '-' && i == 1)
+                if (arg[j] == '-' && j == 1)
                 {
                     // Skip second dash
                     stateNext = ParserState::Name;
                 }
                 else
                 {
-                    if (arg[i] == '=')
+                    if (arg[j] == '=')
                         stateNext = ParserState::Value;
                     else
                     {
-                        name += arg[i];
+                        name += arg[j];
                         stateNext = ParserState::Name;
                     }
                 }
@@ -159,10 +184,26 @@ void def::Flag::Parse(const size_t argumentsCount, char* arguments[], bool start
 
             case ParserState::Value:
             {
-                value += arg[i];
+                if (j == 0 && arg[j] == '-')
+                {
+                    // We have reached the point where we specified something like this
+                    // on the previous chunk: -previous_flag -current_flag.
+                    // So to solve this problem we jump to the ParserState::Name and
+                    // if it was a boolean flag set it to true
+                    MakeTrueOnBool(name);
+                    name.clear();
+                    
+                    stateNext = ParserState::Name;
+                }
+                else
+                {
+                    // Otherwise we have something like this: "-flag value" or "-flag=value"
+                    value += arg[j];
+                }
+
                 // It's not necessary because stateNext is always
                 // ParserState::Value at this point but let's leave it for clarity
-                // stateNext = ParserState::Name;
+                // stateNext = ParserState::Value;
             }
             break;
 
@@ -179,42 +220,56 @@ void def::Flag::Parse(const size_t argumentsCount, char* arguments[], bool start
         {
             if (name.empty())
             {
-                // A dash is the only character in the current text chunk
+                // A dash is the only character in the current chunk
                 throw Exception("[defFlag] You can't do '- ...'");
             }
 
             // Check if we have a flag with the such name
-            stateNext = m_Entries.contains(name) ? ParserState::Value : ParserState::NewToken;
+            if (m_Entries.contains(name))
+                stateNext = ParserState::Value;
+            else
+            {
+                if (ignoreUnexpectedFlags)
+                {
+                    name.clear();
+                    stateNext = ParserState::NewToken;
+                }
+                else
+                    throw Exception("[defFlag] Unexpected flag: " + name);
+            }
         }
         break;
 
         // Check if we've just finished parsing the value
         case ParserState::Value:
         {
-            // At this point we assume that we have the name and the value of the flag
+            // At this point we assume that we have the name
+
+            if (value.empty())
+                throw Exception("[defFlag] No value was provided after '='");
 
             if (!m_Entries.contains(name))
                 throw Exception("[defFlag] Can't find the such flag: " + name);
             
             // We have the such flag so save the value for it
             std::visit(Overload {
-                [&](Entry<bool>& entry) {
-                    if (value == "true" || value == "True" || value == "")
-                        entry.value = true;
-                    else if (value == "false" || value == "False")
-                        entry.value = false;
+                [&](bool& v) {
+                    if (DEF_FLAG_CHECK_TRUE_BOOLEAN(value))
+                        v = true;
+                    else if (DEF_FLAG_CHECK_FALSE_BOOLEAN(value))
+                        v = false;
                     else
-                        throw Exception("[defFlag] Can't parse a value of the boolean flag " + name);
+                        throw Exception("[defFlag] Value of an unexpected type for the " + name + " flag");
                 },
-                [&](Entry<float>& entry) { entry.value = std::stof(value); },
-                [&](Entry<double>& entry) { entry.value = std::stod(value); },
-                [&](Entry<int32_t>& entry) { entry.value = std::stoi(value); },
-                [&](Entry<int64_t>& entry) { entry.value = std::stoll(value); },
-                [&](Entry<uint32_t>& entry) { entry.value = (uint32_t)std::stoul(value); },
-                [&](Entry<uint64_t>& entry) { entry.value = std::stoull(value); },
-                [&](Entry<std::string>& entry) { entry.value = value; },
-                [&](auto& entry) { (void)entry; throw Exception("[defFlag] Unreachable"); },
-            }, m_Entries[name]);
+                [&](float& v) { CHECK_VALUE(v, std::stof(value), name) },
+                [&](double& v) { CHECK_VALUE(v, std::stod(value), name) },
+                [&](int32_t& v) { CHECK_VALUE(v, std::stoi(value), name) },
+                [&](int64_t& v) { CHECK_VALUE(v, std::stoll(value), name) },
+                [&](uint32_t& v) { CHECK_VALUE(v, std::stoul(value), name) },
+                [&](uint64_t& v) { CHECK_VALUE(v, std::stoull(value), name) },
+                [&](std::string& v) { v = value; },
+                [&](auto& v) { (void)v; throw Exception("[defFlag] Unreachable"); },
+            }, m_Entries[name].value);
 
             name.clear();
             value.clear();
@@ -234,14 +289,18 @@ void def::Flag::Parse(const size_t argumentsCount, char* arguments[], bool start
     {
         // The last flag was without a value
         // so if it was a boolean flag then set it's value to true
-        if (std::holds_alternative<Entry<bool>>(m_Entries[name]))
-            std::get<Entry<bool>>(m_Entries[name]).value = true;
+        MakeTrueOnBool(name);
     }
+
+    // In case of no tail just return the number of command line arguments
+    return argumentsCount;
 }
 
+#undef CHECK_VALUE
+
 #define SET_VALUE(T) \
-    m_Entries[name] = Entry<T>{ usage, defaultValue, defaultValue }; \
-    return std::get<Entry<T>>(m_Entries[name]).value;
+    m_Entries[name] = Entry{ usage, defaultValue, defaultValue }; \
+    return std::get<T>(m_Entries[name].value);
 
 bool& def::Flag::Set(const std::string& name, const bool defaultValue, const std::string& usage) { SET_VALUE(bool); }
 
@@ -258,13 +317,35 @@ uint64_t& def::Flag::Set(const std::string& name, const uint64_t defaultValue, c
 
 #undef SET_VALUE
 
-template <class T>
-std::optional<std::reference_wrapper<const def::Flag::Entry<T>>> def::Flag::Lookup(const std::string& name)
+std::optional<std::reference_wrapper<const def::Flag::Entry>> def::Flag::Lookup(const std::string& name)
 {
     if (m_Entries.contains(name))
         return std::nullopt;
 
     return m_Entries.at(name);
+}
+
+void def::Flag::PrintUsage(std::ostream& os)
+{
+    os << "Usage:" << std::endl;
+    
+    for (const auto& [name, entry] : m_Entries)
+    {
+        const std::string defaultValue = std::visit(Overload {
+            [](const std::string& v) { return v; },
+            [](const auto& v) { return std::to_string(v); }
+        }, entry.defaultValue);
+
+        os << "\t-" << name << '=' << defaultValue << ": " << entry.usage << std::endl;
+    }
+}
+
+void def::Flag::MakeTrueOnBool(const std::string& name)
+{
+    auto& value = m_Entries[name].value;
+
+    if (std::holds_alternative<bool>(value))
+        std::get<bool>(value) = true;
 }
 
 #endif // DEF_FLAG_IMPL
