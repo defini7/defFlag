@@ -100,6 +100,9 @@ namespace def
 
         void MakeTrueOnBool(const std::string& name);
 
+        template <class Out, class Return>
+        void ParseInteger(const std::string& input, Out& output, const std::string& name, Return (*convert)(const std::string&, size_t*, int), bool isSigned);
+
     private:
         std::unordered_map<std::string, Entry> m_Entries;
 
@@ -263,10 +266,10 @@ size_t def::Flag::Parse(const size_t argumentsCount, char* arguments[], const bo
                 },
                 [&](float& v) { CHECK_VALUE(v, std::stof(value), name) },
                 [&](double& v) { CHECK_VALUE(v, std::stod(value), name) },
-                [&](int32_t& v) { CHECK_VALUE(v, std::stoi(value), name) },
-                [&](int64_t& v) { CHECK_VALUE(v, std::stoll(value), name) },
-                [&](uint32_t& v) { CHECK_VALUE(v, std::stoul(value), name) },
-                [&](uint64_t& v) { CHECK_VALUE(v, std::stoull(value), name) },
+                [&](int32_t& v) { ParseInteger(value, v, name, std::stoi, true); },
+                [&](int64_t& v) { ParseInteger(value, v, name, std::stoll, true); },
+                [&](uint32_t& v) { ParseInteger(value, v, name, std::stoul, false); },
+                [&](uint64_t& v) { ParseInteger(value, v, name, std::stoull, false); },
                 [&](std::string& v) { v = value; },
                 [&](auto& v) { (void)v; throw Exception("[defFlag] Unreachable"); },
             }, m_Entries[name].value);
@@ -295,8 +298,6 @@ size_t def::Flag::Parse(const size_t argumentsCount, char* arguments[], const bo
     // In case of no tail just return the number of command line arguments
     return argumentsCount;
 }
-
-#undef CHECK_VALUE
 
 #define SET_VALUE(T) \
     m_Entries[name] = Entry{ usage, defaultValue, defaultValue }; \
@@ -347,6 +348,43 @@ void def::Flag::MakeTrueOnBool(const std::string& name)
     if (std::holds_alternative<bool>(value))
         std::get<bool>(value) = true;
 }
+
+template <class Out, class Return>
+void def::Flag::ParseInteger(const std::string& input, Out& output, const std::string& name, Return (*convert)(const std::string&, size_t*, int), bool isSigned)
+{
+    auto charNow = input.begin();
+
+    if (isSigned)
+    {
+        if (*charNow == '-')
+            charNow++;
+    }
+
+    if (*charNow == '0')
+    {
+        charNow++;
+        
+        if (charNow == input.end())
+        {
+            output = 0;
+            return;
+        }
+
+        std::string number(charNow + 1, input.end());
+
+        switch (*charNow)
+        {
+        case 'x': CHECK_VALUE(output, convert(number, nullptr, 16), name); return;
+        case 'b': CHECK_VALUE(output, convert(number, nullptr, 2), name); return;
+        }
+
+        throw Exception("[defFlag] Numeric literal of base 10 can't start with '0'");
+    }
+
+    CHECK_VALUE(output, convert(std::string(charNow, input.end()), nullptr, 10), name);
+}
+
+#undef CHECK_VALUE
 
 #endif // DEF_FLAG_IMPL
 

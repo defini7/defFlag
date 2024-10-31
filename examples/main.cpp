@@ -18,7 +18,7 @@ int main(int argc, char* argv[])
 
         std::cout << std::endl;
     }
-    catch(const def::Flag::Exception& e)
+    catch (const def::Flag::Exception& e)
     {
         std::cerr << e.what() << '\n';
     }
